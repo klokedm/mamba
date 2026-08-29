@@ -366,18 +366,6 @@ def mamba3_siso_bwd_kernel_dqkv(
         strides=[stride_do_seqlen, stride_do_vdim],
         block_shape=[CHUNK_SIZE, HEADDIM_V],
     )
-    dq_desc = tl.make_tensor_descriptor(
-        dQ + dq_offset,
-        shape=[seqlen, headdim_qk],
-        strides=[stride_dq_seqlen, stride_dq_qkdim],
-        block_shape=[CHUNK_SIZE, HEADDIM_QK],
-    )
-    dk_desc = tl.make_tensor_descriptor(
-        dK + dk_offset,
-        shape=[seqlen, headdim_qk],
-        strides=[stride_dk_seqlen, stride_dk_qkdim],
-        block_shape=[CHUNK_SIZE, HEADDIM_QK],
-    )
     dv_desc = tl.make_tensor_descriptor(
         dV + dv_offset,
         shape=[seqlen, headdim_v],
@@ -467,7 +455,13 @@ def mamba3_siso_bwd_kernel_dqkv(
         # Inter-chunk: gradient flowing through accumulated states
         acc_dk += tl.dot(v_block, d_ssm_states_acc.to(v_block.dtype)) * exp_da_cs_rev[:, None]
 
-        dk_desc.store([chunk_start, 0], acc_dk)
+        offs_qk = tl.arange(0, HEADDIM_QK)
+        tl.store(
+            dK + dk_offset + offs_cs[:, None] * stride_dk_seqlen
+            + offs_qk[None, :] * stride_dk_qkdim,
+            acc_dk,
+            mask=seq_mask[:, None] & (offs_qk[None, :] < headdim_qk),
+        )
 
         # ============================================================
         # Compute dQ: Query Gradient
@@ -490,7 +484,12 @@ def mamba3_siso_bwd_kernel_dqkv(
         # Inter-chunk: gradient through states from previous chunks
         acc_dq += tl.dot(do_block, ssm_states_block) * exp_da_cs[:, None]
 
-        dq_desc.store([chunk_start, 0], acc_dq)
+        tl.store(
+            dQ + dq_offset + offs_cs[:, None] * stride_dq_seqlen
+            + offs_qk[None, :] * stride_dq_qkdim,
+            acc_dq,
+            mask=seq_mask[:, None] & (offs_qk[None, :] < headdim_qk),
+        )
 
         # ============================================================
         # Compute dV: Value Gradient
@@ -628,6 +627,9 @@ def compute_dqkv(
     chunk_size: int = 64,
     has_input_state: bool = False,
     Cu_Seqlens: Optional[torch.Tensor] = None,
+    *,
+    _allow_v_tiling: bool = True,
+    _partial_fp32: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Compute gradients dQ_mid, dK_mid, dV, dADT, dQK_dot, dD, d_issm_state for Mamba-3 backward pass.
@@ -680,6 +682,68 @@ def compute_dqkv(
     if D is not None:
         assert D.shape == (nheads,)
 
+    # The fused kernel keeps the complete [HEADDIM_V, HEADDIM_QK] state-gradient
+    # recurrence resident in fp32.  At 256x256 that tensor alone is 262,144 B,
+    # above Hopper's 232,448 B per-block limit.  V rows are independent in the
+    # recurrence, while dQ, dK, dAdt, dQK and dD are sums over those rows.  Run
+    # the unchanged kernel serially on <=128-row V/state slices, accumulate the
+    # shared outputs in fp32 in a fixed order, and concatenate the disjoint dV
+    # and input-state gradients.  There are no atomics and every tile retains
+    # the original reverse chunk order.
+    if _allow_v_tiling and headdim_v > 128:
+        dq_acc = dk_acc = dadt_acc = dqk_acc = dd_acc = None
+        dv_tiles = []
+        dissm_tiles = []
+        for v_start in range(0, headdim_v, 128):
+            v_stop = min(v_start + 128, headdim_v)
+            tile = compute_dqkv(
+                q,
+                k,
+                v[..., v_start:v_stop],
+                da_cs,
+                da_cs_sum,
+                qk_dot,
+                SSM_States[:, :, v_start:v_stop, :],
+                do[..., v_start:v_stop],
+                None if d_ossm_state is None else d_ossm_state[:, :, v_start:v_stop, :],
+                None if d_ov_state is None else d_ov_state[:, :, v_start:v_stop],
+                D,
+                chunk_size,
+                has_input_state,
+                Cu_Seqlens,
+                _allow_v_tiling=False,
+                _partial_fp32=True,
+            )
+            tile_dq, tile_dk, tile_dv, tile_dadt, tile_dqk, tile_dd, tile_dissm = tile
+            if dq_acc is None:
+                dq_acc, dk_acc = tile_dq, tile_dk
+                dadt_acc, dqk_acc = tile_dadt, tile_dqk
+                dd_acc = tile_dd
+            else:
+                dq_acc.add_(tile_dq)
+                dk_acc.add_(tile_dk)
+                dadt_acc.add_(tile_dadt)
+                dqk_acc.add_(tile_dqk)
+                if dd_acc is not None:
+                    dd_acc.add_(tile_dd)
+            dv_tiles.append(tile_dv)
+            if tile_dissm is not None:
+                dissm_tiles.append(tile_dissm)
+
+        assert dq_acc is not None and dk_acc is not None
+        assert dadt_acc is not None and dqk_acc is not None
+        dv = torch.cat(dv_tiles, dim=-1)
+        d_issm_state = torch.cat(dissm_tiles, dim=2) if dissm_tiles else None
+        return (
+            dq_acc.to(q.dtype),
+            dk_acc.to(k.dtype),
+            dv,
+            dadt_acc.to(da_cs.dtype),
+            dqk_acc.to(da_cs.dtype),
+            dd_acc,
+            d_issm_state,
+        )
+
     # Ensure all tensors satisfy TMA alignment constraints.
     #
     # TMA 2D requires the global stride (seqlen dimension, in bytes) to be a
@@ -714,11 +778,12 @@ def compute_dqkv(
         d_ov_state = d_ov_state.contiguous()
 
     # Allocate output tensors
-    dq = torch.empty((batch, seqlen, nheads, headdim_qk), dtype=q.dtype, device=q.device)
-    dk = torch.empty((batch, seqlen, nheads, headdim_qk), dtype=k.dtype, device=k.device)
+    shared_gradient_dtype = torch.float32 if _partial_fp32 else q.dtype
+    dq = torch.empty((batch, seqlen, nheads, headdim_qk), dtype=shared_gradient_dtype, device=q.device)
+    dk = torch.empty((batch, seqlen, nheads, headdim_qk), dtype=shared_gradient_dtype, device=k.device)
     dv = torch.empty((batch, seqlen, nheads, headdim_v), dtype=v.dtype, device=v.device)
-    dAdt = torch.empty_like(da_cs)
-    dQK = torch.empty_like(da_cs)
+    dAdt = torch.empty_like(da_cs, dtype=torch.float32 if _partial_fp32 else da_cs.dtype)
+    dQK = torch.empty_like(da_cs, dtype=torch.float32 if _partial_fp32 else da_cs.dtype)
     dD = torch.empty((num_sequences, nheads), dtype=torch.float32, device=q.device) if D is not None else None
     d_issm_state = torch.empty((num_sequences, nheads, headdim_v, headdim_qk), dtype=torch.float32, device=q.device) if has_input_state else None
 
@@ -1629,6 +1694,8 @@ def compute_ddt_dtrap_dinput_states(
     input_k_state: Optional[torch.Tensor] = None,
     input_v_state: Optional[torch.Tensor] = None,
     Cu_Seqlens: Optional[torch.Tensor] = None,
+    *,
+    _allow_v_tiling: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Compute dDT, dTrap from dScale/dGamma, and optionally input state gradients.
@@ -1677,6 +1744,60 @@ def compute_ddt_dtrap_dinput_states(
             f"input_v_state shape mismatch: {input_v_state.shape}"
     else:
         headdim_v, headdim_qk = 64, 128  # Dummy values for block size calculation
+
+    # This kernel also keeps the complete [HEADDIM_V, HEADDIM_QK]
+    # d_ISSM_State matrix resident in fp32.  Split only the independent V rows
+    # when that matrix is wider than Hopper can compile safely.  A state-free
+    # call computes the sequence-wide dDT/dTrap terms once.  Each <=128-row
+    # state call then contributes only its V-row reduction because zero
+    # dscale/dgamma tensors make Part 1 exactly zero.  Shared reductions are
+    # accumulated serially in fp32; row-disjoint outputs are concatenated.
+    if _allow_v_tiling and has_input_state and headdim_v > 128:
+        ddt_acc, dtrap_acc, _, _, _ = compute_ddt_dtrap_dinput_states(
+            dscale,
+            dgamma,
+            dt,
+            trap,
+            Cu_Seqlens=Cu_Seqlens,
+            _allow_v_tiling=False,
+        )
+        zero_dscale = torch.zeros_like(dscale)
+        zero_dgamma = torch.zeros_like(dgamma)
+        dinput_ssm_tiles = []
+        dinput_v_tiles = []
+        dinput_k_acc = None
+
+        for v_start in range(0, headdim_v, 128):
+            v_stop = min(v_start + 128, headdim_v)
+            tile = compute_ddt_dtrap_dinput_states(
+                zero_dscale,
+                zero_dgamma,
+                dt,
+                trap,
+                d_issm_state[:, :, v_start:v_stop, :],
+                input_k_state,
+                input_v_state[:, :, v_start:v_stop],
+                Cu_Seqlens,
+                _allow_v_tiling=False,
+            )
+            tile_ddt, tile_dtrap, tile_dinput_ssm, tile_dinput_k, tile_dinput_v = tile
+            ddt_acc.add_(tile_ddt)
+            dtrap_acc.add_(tile_dtrap)
+            if dinput_k_acc is None:
+                dinput_k_acc = tile_dinput_k
+            else:
+                dinput_k_acc.add_(tile_dinput_k)
+            dinput_ssm_tiles.append(tile_dinput_ssm)
+            dinput_v_tiles.append(tile_dinput_v)
+
+        assert dinput_k_acc is not None
+        return (
+            ddt_acc,
+            dtrap_acc,
+            torch.cat(dinput_ssm_tiles, dim=2),
+            dinput_k_acc,
+            torch.cat(dinput_v_tiles, dim=2),
+        )
 
     # Ensure contiguity
     dscale = dscale.contiguous() if not dscale.is_contiguous() else dscale
